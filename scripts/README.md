@@ -2,10 +2,22 @@
 
 Script interactivo para configurar conexiones iSCSI a cabinas **Huawei Dorado** desde un cluster **Proxmox VE**.
 
+## Instalación
+
+En cada nodo Proxmox, ejecutar como **root**:
+
+```bash
+cd /root
+curl -LO https://raw.githubusercontent.com/licosta/proxmox/main/scripts/pve_iscsi_dorado.sh
+chmod +x pve_iscsi_dorado.sh
+./pve_iscsi_dorado.sh
+```
+
+**Copiar y pegar las 5 líneas tal cual. No requiere nada más.**
+
 ## Uso
 
 ```bash
-chmod +x pve_iscsi_dorado.sh
 ./pve_iscsi_dorado.sh
 ```
 
