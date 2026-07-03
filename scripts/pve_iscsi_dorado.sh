@@ -151,23 +151,51 @@ step_welcome() {
 step_cluster_info() {
     print_step " PASO 1: Información del Cluster"
 
+    # Detectar si hay cluster
+    local cluster_mode="standalone"
+    if command -v pvecm &>/dev/null && pvecm nodes 2>/dev/null | grep -qE "^[[:space:]]*[0-9]+"; then
+        local node_count
+        node_count=$(pvecm nodes 2>/dev/null | grep -cE "^[[:space:]]*[0-9]+")
+        if [[ "$node_count" -gt 1 ]]; then
+            cluster_mode="cluster"
+        fi
+    fi
+
     echo ""
-    echo "Introduce los nombres de los nodos Proxmox separados por coma."
-    echo "Si solo tienes un nodo, escribe su nombre de host."
+    if [[ "$cluster_mode" == "cluster" ]]; then
+        echo -e "${GREEN}✓ Cluster detectado (${node_count} nodos)${NC}"
+        echo "Se configurarán los iniciadores en todos los nodos del cluster."
+    else
+        echo -e "${YELLOW}⚠ Standalone o cluster de 1 nodo detectado${NC}"
+        echo "Se configurará el iniciador en este nodo únicamente."
+        echo "Si más adelante agregás más nodos al cluster, ejecutá el script"
+        echo "desde cada nodo nuevo."
+    fi
     echo ""
-    echo -e "${CYAN}Ejemplo:${NC} pve1,pve2,pve3"
+
+    echo "Introduce los nombres de los nodos separados por coma."
+    echo "Si solo es un nodo, escribe su nombre de host."
+    echo ""
+    echo -e "${CYAN}Ejemplo cluster:${NC} pve1,pve2,pve3"
+    echo -e "${CYAN}Ejemplo standalone:${NC} pve1"
     echo ""
 
     local default_node
     default_node=$(hostname)
-    read -p "Nodos del cluster [${default_node}]: " NODES_INPUT
+    read -p "Nodos [${default_node}]: " NODES_INPUT
     NODES="${NODES_INPUT:-${default_node}}"
     NODES=$(echo "$NODES" | sed 's/[[:space:]]*,[[:space:]]*/,/g' | sed 's/^,//;s/,$//')
 
-    ok "Nodos configurados: ${NODES}"
+    IFS=',' read -ra NODE_ARRAY <<< "$NODES"
+    local actual_count=${#NODE_ARRAY[@]}
+
+    if [[ $actual_count -eq 1 ]]; then
+        ok "Modo standalone — 1 nodo: ${NODES}"
+    else
+        ok "Modo cluster — ${actual_count} nodos: ${NODES}"
+    fi
 
     # Verificar SSH a nodos remotos
-    IFS=',' read -ra NODE_ARRAY <<< "$NODES"
     for node in "${NODE_ARRAY[@]}"; do
         node=$(echo "$node" | tr -d ' ')
         if [[ "$node" == "$(hostname)" ]]; then
@@ -177,7 +205,7 @@ step_cluster_info() {
             if timeout 5 ssh $SSH_OPTS "root@${node}" "echo ok" &>/dev/null; then
                 ok "SSH OK"
             else
-                warn "SSH falló o no reachable. ¿ passwordless SSH configurado?"
+                warn "SSH falló o no reachable. Verificar passwordless SSH."
                 echo -n "   ¿Seguir igual? [s/N]: "
                 local cont; read cont
                 if [[ ! "$cont" =~ ^[sS]$ ]]; then
@@ -264,32 +292,91 @@ step_network() {
     print_step " PASO 3: Configuración de Red iSCSI"
 
     echo ""
-    echo "Indica las interfaces de red dedicadas a iSCSI."
-    echo "Para multipath dual-port, especifica una interfaz por cada camino."
+    echo -e "${YELLOW}IMPORTANTE:${NC} Las interfaces deben tener IP configurada beforehand."
+    echo "            Este script solo ajusta el MTU, no configura IPs."
     echo ""
 
-    # Mostrar interfaces disponibles
-    echo "Interfaces disponibles en este nodo:"
-    ip -br link show | grep -v "^lo\|^docker\|^veth" | awk '{print "   " $1 " (" $2 ")"}'
+    # Mostrar interfaces disponibles con IP
+    echo "Interfaces con IP asignada en este nodo:"
+    ip -br addr show | grep -v "^lo\|^docker\|^veth" | awk '{print "   " $1 " → " $3}'
 
     echo ""
+    echo "Indica las interfaces dedicadas a iSCSI."
+    echo "Si tienes dual-port ALUA, especifica una iface por cada portal."
+    echo ""
+
     read -p "Interfaz para Portal A (ej: enp0s3): " IFACE_A
     echo ""
-    read -p "Interfaz para Portal B [opcional]: " IFACE_B
+    read -p "Interfaz para Portal B [opcional, solo si tienes segundo portal]: " IFACE_B
 
     if [[ -z "$IFACE_A" ]]; then
-        warn "Sin iface específica, se usará la ruta por defecto."
+        warn "Sin iface específica, se usará la ruta por defecto del kernel."
     else
         ok "Iface A: ${IFACE_A}"
+        # Verificar que tiene IP
+        local iface_ip
+        iface_ip=$(ip -br addr show "$IFACE_A" 2>/dev/null | awk '{print $3}' || true)
+        if [[ -n "$iface_ip" ]]; then
+            ok "  IP actual: ${iface_ip}"
+        else
+            warn "  No tiene IP asignada en este nodo."
+            warn "  Asegurate de que la IP esté configurada (static o DHCP)."
+        fi
+
         if [[ -n "$IFACE_B" ]]; then
             ok "Iface B: ${IFACE_B}"
+            iface_ip=$(ip -br addr show "$IFACE_B" 2>/dev/null | awk '{print $3}' || true)
+            if [[ -n "$iface_ip" ]]; then
+                ok "  IP actual: ${iface_ip}"
+            else
+                warn "  No tiene IP asignada en este nodo."
+            fi
         fi
     fi
 
     echo ""
-    read -p "MTU para la red iSCSI [9000]: " tmp_mtu
+    echo "Ajuste de MTU para la red iSCSI:"
+    echo "  9000  → Jumbo frames (recomendado para iSCSI)"
+    echo "  1500  → MTU estándar"
+    echo ""
+    read -p "¿MTU? [9000]: " tmp_mtu
     MTU="${tmp_mtu:-9000}"
-    ok "MTU: ${MTU}"
+
+    if [[ "$MTU" == "9000" ]]; then
+        ok "MTU: ${MTU} (jumbo frames)"
+        if [[ -n "$IFACE_A" ]]; then
+            echo -n "   ¿Aplicar MTU ${MTU} a ${IFACE_A}? [s/N]: "
+            local apply_mtu; read apply_mtu
+            if [[ "$apply_mtu" =~ ^[sS]$ ]]; then
+                ip link set "$IFACE_A" mtu "$MTU" 2>/dev/null && ok "MTU aplicado a ${IFACE_A}" || warn "No se pudo aplicar MTU"
+            fi
+            if [[ -n "$IFACE_B" ]]; then
+                echo -n "   ¿Aplicar MTU ${MTU} a ${IFACE_B}? [s/N]: "
+                read apply_mtu
+                if [[ "$apply_mtu" =~ ^[sS]$ ]]; then
+                    ip link set "$IFACE_B" mtu "$MTU" 2>/dev/null && ok "MTU aplicado a ${IFACE_B}" || warn "No se pudo aplicar MTU"
+                fi
+            fi
+        fi
+        if [[ -n "$IFACE_A" ]]; then
+            echo -n "   ¿Aplicar MTU ${MTU} a ${IFACE_A}? [s/N]: "
+            local apply_mtu; read apply_mtu
+            if [[ "$apply_mtu" =~ ^[sS]$ ]]; then
+                ip link set "$IFACE_A" mtu "$MTU" && ok "MTU ${MTU} aplicado a ${IFACE_A}" || warn "No se pudo aplicar MTU a ${IFACE_A}"
+            fi
+            if [[ -n "$IFACE_B" ]]; then
+                echo -n "   ¿Aplicar MTU ${MTU} a ${IFACE_B}? [s/N]: "
+                read apply_mtu
+                if [[ "$apply_mtu" =~ ^[sS]$ ]]; then
+                    ip link set "$IFACE_B" mtu "$MTU" && ok "MTU ${MTU} aplicado a ${IFACE_B}" || warn "No se pudo aplicar MTU a ${IFACE_B}"
+                fi
+            fi
+        fi
+    else
+        ok "MTU: ${MTU}"
+    fi
+
+    ok "Configuración de red completada"
 }
 
 # ─── 4. CHAP ──────────────────────────────────────────────────────────────────
@@ -591,25 +678,133 @@ step_discovery() {
     done
 }
 
-# ─── 12. Autorización ─────────────────────────────────────────────────────────
+# ─── 12. Preparación en Dorado (antes del login) ──────────────────────────────
+step_dorado_prep() {
+    print_step " PASO 12: Preparación en Dorado (antes del login)"
+
+    echo ""
+    echo -e "${BOLD}Antes de hacer el login, creá el Host en Dorado con estos IQNs:${NC}"
+    echo ""
+    echo -e "  ┌──────────────────────────────────────────────────────────────────┐"
+    printf   "  │ %-20s │ %-52s │\n" "NODO" "IQN DEL INICIADOR"
+    echo -e "  ├──────────────────────────────────────────────────────────────────┤"
+    for node in "${!NODE_IQNS[@]}"; do
+        printf "  │ %-20s │ %-52s │\n" "$node" "${NODE_IQNS[$node]}"
+    done
+    echo -e "  └──────────────────────────────────────────────────────────────────┘"
+    echo ""
+
+    echo -e "${CYAN}En la consola de Dorado, hacé esto:${NC}"
+    echo ""
+    echo -e "${BOLD}1.${NC} Ve a: Configuración > Hosts > Crear Host"
+    echo "   - Nombre: pve_cluster (o el que prefieras)"
+    echo "   - Tipo: Host iSCSI"
+    echo ""
+    echo -e "${BOLD}2.${NC} Añadí los IQNs de arriba al host (uno por cada nodo)"
+    echo ""
+    echo -e "${BOLD}3.${NC} Asociá el host con el target: ${TARGET_IQN}"
+    echo "   Portales: ${PORTAL_A}:${ISCSI_PORT}${PORTAL_B:+ y ${PORTAL_B}:${ISCSI_PORT}}"
+    echo ""
+    echo -e "${BOLD}4.${NC} MAPEÁ las LUNs al host (LUN ${LUN_ID} y las que necesites)"
+    echo ""
+    echo -e "${BOLD}5.${NC} Guardá los cambios en Dorado"
+    echo ""
+    echo -e "${YELLOW}Cuando esté todo listo, volvé aquí y presioná ENTER.${NC}"
+    echo ""
+    echo "El siguiente paso será hacer el login — en ese momento aparecerán"
+    echo "los iniciadores en la consola de Dorado para asociarlos y autorizar."
+    echo ""
+
+    press_enter
+    ok "Continuando al login..."
+}
+
+# ─── 13. Login ─────────────────────────────────────────────────────────────────
+step_login() {
+    print_step " PASO 13: Login a los Targets"
+
+    echo ""
+    echo -e "${YELLOW}ATENCIÓN:${NC} Al ejecutar el login, Dorado mostrará los iniciadores"
+    echo "en su consola. Después del login tendés que asociarlos y autorizar."
+    echo ""
+
+    IFS=',' read -ra NODE_ARRAY <<< "$NODES"
+
+    for node in "${NODE_ARRAY[@]}"; do
+        node=$(echo "$node" | tr -d ' ')
+        print_substep "${node} → login en ${PORTAL_A}:${ISCSI_PORT}..."
+
+        # CHAP
+        if [[ -n "$CHAP_USER" ]]; then
+            local chap_cmds=(
+                "iscsiadm -m node -T ${TARGET_IQN} -p ${PORTAL_A}:${ISCSI_PORT} -I ${INITIATOR_IFACE_NAME} -o update -n node.session.auth.authmethod -v CHAP"
+                "iscsiadm -m node -T ${TARGET_IQN} -p ${PORTAL_A}:${ISCSI_PORT} -I ${INITIATOR_IFACE_NAME} -o update -n node.session.auth.username -v '${CHAP_USER}'"
+                "iscsiadm -m node -T ${TARGET_IQN} -p ${PORTAL_A}:${ISCSI_PORT} -I ${INITIATOR_IFACE_NAME} -o update -n node.session.auth.password -v '${CHAP_PASS}'"
+            )
+            if [[ "$node" == "$(hostname)" ]]; then
+                for c in "${chap_cmds[@]}"; do eval "$c" 2>/dev/null || true; done
+            else
+                for c in "${chap_cmds[@]}"; do ssh $SSH_OPTS "root@${node}" "$c" 2>/dev/null || true; done
+            fi
+            ok "CHAP configurado"
+        fi
+
+        # Login
+        local login_cmd="iscsiadm -m node -T ${TARGET_IQN} -p ${PORTAL_A}:${ISCSI_PORT} -I ${INITIATOR_IFACE_NAME} --login"
+        if [[ "$node" == "$(hostname)" ]]; then
+            local result; result=$(eval "$login_cmd" 2>&1 || true)
+            if echo "$result" | grep -qi "login failed\|iscsi_err"; then
+                warn "Login tuvo problemas: $result"
+            else
+                ok "Login enviado"
+            fi
+        else
+            ssh $SSH_OPTS "root@${node}" "$login_cmd" 2>/dev/null && ok "${node} A: OK" || warn "${node} A: tuvo problemas"
+        fi
+
+        # Persist
+        local persist_cmd="iscsiadm -m node -T ${TARGET_IQN} -p ${PORTAL_A}:${ISCSI_PORT} -I ${INITIATOR_IFACE_NAME} -o update -n node.startup -v automatic"
+        if [[ "$node" == "$(hostname)" ]]; then
+            eval "$persist_cmd" 2>/dev/null || true
+        else
+            ssh $SSH_OPTS "root@${node}" "$persist_cmd" 2>/dev/null || true
+        fi
+
+        # Portal B
+        if [[ -n "$PORTAL_B" ]]; then
+            print_substep "${node} → login en ${PORTAL_B}:${ISCSI_PORT}..."
+            if [[ "$node" == "$(hostname)" ]]; then
+                iscsiadm -m node -T "${TARGET_IQN}" -p "${PORTAL_B}:${ISCSI_PORT}" -I "${INITIATOR_IFACE_NAME}" --login 2>&1 && ok "OK" || warn "falló"
+            else
+                ssh $SSH_OPTS "root@${node}" "iscsiadm -m node -T ${TARGET_IQN} -p ${PORTAL_B}:${ISCSI_PORT} -I ${INITIATOR_IFACE_NAME} --login" 2>/dev/null && ok "${node} B: OK" || warn "${node} B: falló"
+            fi
+        fi
+    done
+
+    echo ""
+    ok "Login enviado a todos los nodos"
+    echo ""
+    echo "Sesiones iSCSI activas:"
+    iscsiadm -m session -P1 2>/dev/null | grep -E "tcp|Portal" | head -20 || echo "   Ninguna visible todavía"
+}
+
+# ─── 14. Autorización post-login ──────────────────────────────────────────────
 step_authorization() {
-    print_step " ⬅️  PASO 12: AUTORIZACIÓN EN DORADO ⬅️"
+    print_step " ⬅️  PASO 14: AUTORIZACIÓN EN DORADO (POST-LOGIN)"
 
     echo ""
     echo -e "${RED}${BOLD}╔══════════════════════════════════════════════════════════════════╗${NC}"
     echo -e "${RED}${BOLD}║          ACCIÓN REQUERIDA EN LA CONSOLA DORADO              ║${NC}"
     echo -e "${RED}${BOLD}╚══════════════════════════════════════════════════════════════════╝${NC}"
     echo ""
-    echo -e "${BOLD}Ve a la consola de gestión de Huawei Dorado y realiza estos pasos:${NC}"
+    echo -e "${BOLD}El login ya se ejecutó. Ahora asociá y autorizá los iniciadores:${NC}"
     echo ""
     echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo -e "${BOLD}PASO 1:${NC} Crea un Host o Host Group
-  - Ve a: Configuración > Hosts > Crear Host
-  - Nombre: pve_cluster (o el que prefieras)
-  - Tipo: Host iSCSI"
+    echo -e "${BOLD}1.${NC} En la consola de Dorado, buscá los iniciadores que aparecieron."
+    echo "   Deberían estar en: Hosts > pve_cluster > Initiators"
     echo ""
     echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo -e "${BOLD}PASO 2:${NC} Añade estos IQNs de iniciador al host:"
+    echo -e "${BOLD}2.${NC} Asociá CADA iniciador al host:"
     echo ""
     echo -e "  ┌──────────────────────────────────────────────────────────────────┐"
     printf   "  │ %-20s │ %-52s │\n" "NODO" "IQN DEL INICIADOR"
@@ -620,55 +815,43 @@ step_authorization() {
     echo -e "  └──────────────────────────────────────────────────────────────────┘"
     echo ""
     echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo -e "${BOLD}PASO 3:${NC} Asocia el host con el target:
-  - Target: ${TARGET_IQN}
-  - Portales: ${PORTAL_A}:${ISCSI_PORT}${PORTAL_B:+ y ${PORTAL_B}:${ISCSI_PORT}}"
+    echo -e "${BOLD}3.${NC} Autorizá cada iniciador (Enable / Allow)"
     echo ""
     echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo -e "${BOLD}PASO 4:${NC} Mapea las LUNs al host:
-  - Selecciona la LUN ${LUN_ID} (y las adicionales que necesites)
-  - Asigna todos los nodos como iniciadores"
+    echo -e "${BOLD}4.${NC} Verificá que la LUN ${LUN_ID} esté mapeada al host"
     echo ""
     echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo -e "${BOLD}PASO 5:${NC} Verifica que el target y LUN están activos en Dorado"
+    echo -e "${BOLD}5.${NC} Guardá los cambios en Dorado"
     echo ""
-    echo -e "${YELLOW}${BOLD}Una vez completado TODO en Dorado, vuelve aquí y presiona ENTER${NC}"
+    echo -e "${YELLOW}Cuando esté todo autorizado, volvé aquí y presioná ENTER.${NC}"
     echo ""
 
     press_enter
 
     echo ""
-    echo "Verificando si la autorización está lista..."
-    echo ""
-
+    echo "Esperando a que las LUNs se detecten..."
     local auth_ok=false
     local waited=0
 
-    while [[ "$auth_ok" == "false" && $waited -lt 120 ]]; do
-        echo -n "   Probando conexión... "
-        local test_result
-        test_result=$(iscsiadm -m discovery -t st -p "${PORTAL_A}:${ISCSI_PORT}" -I "${INITIATOR_IFACE_NAME}" 2>&1 || true)
-
-        if echo "$test_result" | grep -qi "${TARGET_IQN}"; then
-            ok "¡Autorización detectada! El target es visible."
+    while [[ "$auth_ok" == "false" && $waited -lt 180 ]]; do
+        echo -n "   Verificando LUNs visibles... "
+        local lun_count
+        lun_count=$(lsblk -d -n -o NAME 2>/dev/null | grep -cE '^sd[a-z]+$|^dm-[0-9]+$' || echo "0")
+        if [[ "$lun_count" -gt 0 ]]; then
+            ok "LUN visible ($lun_count dispositivos)"
             auth_ok=true
         else
-            echo -ne "${YELLOW}Target no visible aún. ¿Seguir esperando? [S]: ${NC}"
-            local retry; read retry
+            waited=$((waited + 15))
+            echo -ne "${YELLOW}Aún sin LUN (${waited}s). ¿Seguir? [S]: ${NC}"
+            local retry; read -t 15 retry || true
             if [[ "$retry" =~ ^[nN]$ ]]; then
-                warn "Continuando igualmente (la autorización puede estar lista)"
+                warn "Continuando igualmente..."
                 auth_ok=true
-            else
-                waited=$((waited + 15))
             fi
         fi
     done
 
-    if [[ "$auth_ok" == "true" ]]; then
-        ok "Listo para continuar con el login"
-    else
-        warn "No se pudo verificar la autorización. Continuando bajo tu riesgo."
-    fi
+    [[ "$auth_ok" == "true" ]] && ok "Continuando con la configuración..."
 }
 
 # ─── 13. Login ─────────────────────────────────────────────────────────────────
@@ -739,7 +922,7 @@ step_login() {
 
 # ─── 14. Multipath config ──────────────────────────────────────────────────────
 step_multipath() {
-    print_step " PASO 14: Configurando Multipath"
+    print_step " PASO 15: Configurando Multipath"
 
     echo ""
     echo "Generando multipath.conf optimizado para Huawei Dorado ALUA..."
@@ -856,7 +1039,7 @@ EOF
 
 # ─── 15. Rescan + WWIDs ───────────────────────────────────────────────────────
 step_scan_wwids() {
-    print_step " PASO 15: Escaneando LUNs y Detectando WWIDs"
+    print_step " PASO 16: Escaneando LUNs y Detectando WWIDs"
 
     echo ""
     echo "Rescaneando buses SCSI para detectar las LUNs de Dorado..."
@@ -976,7 +1159,7 @@ step_scan_wwids() {
 
 # ─── 16. Agregar WWIDs al multipath ───────────────────────────────────────────
 step_add_wwids() {
-    print_step " PASO 16: Agregando WWIDs al Multipath"
+    print_step " PASO 17: Agregando WWIDs al Multipath"
 
     if [[ ${#ALL_WWIDS[@]} -eq 0 ]]; then
         echo ""
@@ -1040,7 +1223,7 @@ EOF
 
 # ─── 17. Primer nodo del cluster ─────────────────────────────────────────────
 step_first_node() {
-    print_step " PASO 17: Identificando Nodo Principal"
+    print_step " PASO 18: Identificando Nodo Principal"
 
     echo ""
     echo "En un cluster Proxmox VE, el storage se crea desde CUALQUIER nodo"
@@ -1092,7 +1275,7 @@ step_first_node() {
 
 # ─── 18. Crear storage ────────────────────────────────────────────────────────
 step_create_storage() {
-    print_step " PASO 18: Creando Storage en Proxmox VE"
+    print_step " PASO 19: Creando Storage en Proxmox VE"
 
     if ! command -v pvesm &>/dev/null; then
         warn "pvesm no disponible. Omitiendo creación de storage."
@@ -1148,7 +1331,7 @@ step_create_storage() {
 
 # ─── 18. Habilitar servicios ──────────────────────────────────────────────────
 step_enable_services() {
-    print_step " PASO 18: Habilitando Servicios"
+    print_step " PASO 20: Habilitando Servicios"
 
     echo ""
     print_substep "Habilitando servicios en todos los nodos..."
@@ -1169,7 +1352,7 @@ step_enable_services() {
 
 # ─── 19. Verificación final ──────────────────────────────────────────────────
 step_verify() {
-    print_step " PASO 19: Verificación Final"
+    print_step " PASO 21: Verificación Final"
 
     echo ""
     echo -e "  ┌──────────────┬────────────────┬──────────────┬─────────┬──────────────┐"
@@ -1217,7 +1400,7 @@ step_verify() {
     ls -la /dev/disk/by-id/ 2>/dev/null | grep -iE "scsi-|naa\.|huawei|dorado" | head -10 || echo "   Ninguno"
 }
 
-# ─── 20. Final ────────────────────────────────────────────────────────────────
+# ─── 22. Final ────────────────────────────────────────────────────────────────
 step_final() {
     print_step " ¡CONFIGURACIÓN COMPLETADA!"
 
@@ -1298,8 +1481,9 @@ main() {
     step_configure_initiators
     step_create_iface
     step_discovery
-    step_authorization
+    step_dorado_prep
     step_login
+    step_authorization
     step_multipath
     step_scan_wwids
     step_add_wwids
